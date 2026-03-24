@@ -859,6 +859,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         free_memory_bytes = min(ray.get(future) for future in futures)
         return free_memory_bytes
 
+    def close_zmq(self) -> None:
+        """Close ZMQ sockets on all workers so another policy can bind the same addresses."""
+        futures = self.worker_group.run_all_workers_single_data("close_zmq")
+        ray.get(futures)
+
     def stream_weights_via_ipc_zmq(
         self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:

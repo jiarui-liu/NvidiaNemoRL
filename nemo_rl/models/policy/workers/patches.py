@@ -16,8 +16,15 @@ import os
 from importlib.util import find_spec
 
 import torch
-from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
-from torch.distributed.tensor._ops.utils import register_op_strategy
+
+# register_op_strategy and propagate_single_input_strategy are only needed for
+# the PyTorch 2.9.0 alias tensor patch. They were moved/removed in 2.10+.
+try:
+    from torch.distributed.tensor._ops._tensor_ops import propagate_single_input_strategy
+    from torch.distributed.tensor._ops.utils import register_op_strategy
+except ImportError:
+    register_op_strategy = None
+    propagate_single_input_strategy = None
 
 
 def _get_transformer_engine_file(relative_path: str) -> str:
@@ -117,9 +124,12 @@ def apply_torch_aten_alias_tensor_patch():
     in PyTorch 2.9. See https://github.com/pytorch/pytorch/pull/166867 for the upstream fix.
     We can remove this patch when we upgrade torch to include this fix.
     """
-    assert torch.__version__.startswith("2.9.0"), (
-        "This patch is needed for torch 2.9.0. Please retest if you upgrade torch to a newer version and remove this patch."
-    )
+    if not torch.__version__.startswith("2.9.0"):
+        # Patch only needed for torch 2.9.0; upstream fix included in 2.10+.
+        return
+    if register_op_strategy is None or propagate_single_input_strategy is None:
+        print("Skipping aten.alias patch: required imports not available")
+        return
     try:
         register_op_strategy(torch.ops.aten.alias.default)(
             propagate_single_input_strategy

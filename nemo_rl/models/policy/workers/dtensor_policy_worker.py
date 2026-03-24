@@ -198,7 +198,10 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         self.cfg = config
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
-        torch.distributed.init_process_group(backend="nccl")
+        # Register both NCCL (CUDA) and Gloo (CPU) backends so that DTensor
+        # full_tensor() works even when the model has been offloaded to CPU
+        # (e.g. colocated inference with TP=1).
+        torch.distributed.init_process_group(backend="cuda:nccl,cpu:gloo")
         self.rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
@@ -1770,19 +1773,22 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors.
+
+            IPC ZMQ streaming uses CUDA IPC handles, so all yielded tensors
+            must reside on CUDA even when the model has been offloaded to CPU.
+            """
             for name, tensor in self.model.state_dict().items():
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
+                    # Ensure CUDA + target dtype for IPC streaming
                     yield (
                         name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                        full_tensor.to(device="cuda", dtype=self.dtype, non_blocking=True).contiguous(),
                     )
                 else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+                    yield name, tensor.to(device="cuda", dtype=self.dtype, non_blocking=True).contiguous()
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(

@@ -96,13 +96,18 @@ class AbstractPolicyWorker:
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
+    def close_zmq(self) -> None:
+        """Close and clean up ZMQ socket so another policy can bind the same address."""
+        if hasattr(self, "zmq_socket"):
+            self.zmq_socket.close()
+            self.zmq_context.term()
+            del self.zmq_socket
+            del self.zmq_context
+
     def shutdown(self) -> bool:
         """Shutdown the policy."""
         try:
-            # Clean up extension resources like ZMQ sockets
-            if hasattr(self, "zmq_socket"):
-                self.zmq_socket.close()
-                self.zmq_context.term()
+            self.close_zmq()
             return True
         except Exception:
             return False

@@ -317,13 +317,22 @@ class BaseVllmGenerationWorker:
                 f.write(content)
             logger.info("Successfully patched vllm speculative decoding post_step.")
 
-        _patch_vllm_init_workers_ray()
-        logger.info("Successfully patched vllm _init_workers_ray.")
+        try:
+            _patch_vllm_init_workers_ray()
+            logger.info("Successfully patched vllm _init_workers_ray.")
+        except RuntimeError as e:
+            logger.warning(f"Skipping vllm _init_workers_ray patch (version mismatch?): {e}")
 
-        _patch_vllm_vit_flash_attn_backend()
-        logger.info("Successfully patched vllm vit flash attention backend.")
+        try:
+            _patch_vllm_vit_flash_attn_backend()
+            logger.info("Successfully patched vllm vit flash attention backend.")
+        except RuntimeError as e:
+            logger.warning(f"Skipping vllm vit flash attn patch (version mismatch?): {e}")
 
-        _patch_vllm_speculative_decoding_post_step()
+        try:
+            _patch_vllm_speculative_decoding_post_step()
+        except RuntimeError as e:
+            logger.warning(f"Skipping vllm speculative decoding patch (version mismatch?): {e}")
 
         try:
             import vllm
