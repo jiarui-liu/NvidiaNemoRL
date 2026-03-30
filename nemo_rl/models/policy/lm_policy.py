@@ -70,14 +70,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
         processor: Optional[AutoProcessor] = None,
-        worker_extension_cls_fqn: Optional[str] = None,
     ):
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
             optimizer_path = os.path.abspath(optimizer_path)
 
-        worker_builder_cls_fqn: str
+        worker_builder_cls: str
         tp_size = 1
         pp_size = 1
         cp_size = 1
@@ -90,7 +89,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
         if megatron_enable:
-            worker_builder_cls_fqn = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+            worker_builder_cls = "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
@@ -113,7 +112,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
             use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
             if use_v2:
-                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
 
                 if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                     warnings.warn(
@@ -125,19 +124,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
-                worker_builder_cls_fqn = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                worker_builder_cls = "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
-
-        # If a worker extension class is provided, use it instead of the default worker builder class
-        if worker_extension_cls_fqn is not None:
-            print(
-                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
-            )
-            worker_builder_cls_fqn = worker_extension_cls_fqn
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -196,7 +188,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         pre_init_queue = RayQueue()
         worker_builder = RayWorkerBuilder(
-            worker_builder_cls_fqn,
+            worker_builder_cls,
             config,
             tokenizer=tokenizer,
             processor=processor,
@@ -282,44 +274,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
-
-    def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
-        """Run a method on all workers in parallel with the same data.
-
-        Mainly used for worker extension classes.
-
-        Args:
-            method_name: The name of the method to run.
-            *args: The positional arguments to pass to the method.
-            **kwargs: The keyword arguments to pass to the method.
-
-        Returns:
-            The results of the method run on all workers.
-        """
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name, *args, **kwargs
-        )
-        results = ray.get(futures)
-        return results
-
-    def run_all_workers_multiple_data(self, method_name: str, *args, **kwargs) -> Any:
-        """Run a method on all workers in parallel with different data.
-
-        Mainly used for worker extension classes.
-
-        Args:
-            method_name: The name of the method to run.
-            *args: The positional arguments to pass to the method.
-            **kwargs: The keyword arguments to pass to the method.
-
-        Returns:
-            The results of the method run on all workers.
-        """
-        futures = self.worker_group.run_all_workers_multiple_data(
-            method_name, *args, **kwargs
-        )
-        results = ray.get(futures)
-        return results
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -1001,3 +955,55 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             table.add_row(row)
 
         print(table)
+
+    def copy_weights_from(self, source_policy: "Policy") -> None:
+        """Copy weights from source policy to this policy.
+
+        Used for initializing EMA teacher from student weights.
+
+        Args:
+            source_policy: The policy to copy weights from
+        """
+        # Get state dict from source policy
+        source_state_futures = source_policy.worker_group.run_all_workers_single_data(
+            "get_model_state_dict"
+        )
+        source_states = ray.get(source_state_futures)
+
+        # Load state dict into this policy - send each worker's state dict to corresponding worker
+        target_futures = []
+        for worker_idx, state_dict in enumerate(source_states):
+            future = self.worker_group.workers[worker_idx].load_model_state_dict.remote(
+                state_dict=state_dict
+            )
+            target_futures.append(future)
+        ray.get(target_futures)
+
+    def update_from_ema(
+        self, student_policy: "Policy", update_info: dict[str, Any]
+    ) -> None:
+        """Update this policy's parameters using EMA from student policy.
+
+        Formula: self.params = ema_decay * self.params + (1 - ema_decay) * student.params
+
+        Args:
+            student_policy: The student policy whose parameters will be used for EMA update
+            update_info: Dictionary containing 'ema_decay' parameter
+        """
+        ema_decay = update_info["ema_decay"]
+
+        # Get student state dict
+        student_state_futures = student_policy.worker_group.run_all_workers_single_data(
+            "get_model_state_dict"
+        )
+        student_states = ray.get(student_state_futures)
+
+        # Update teacher parameters with EMA - send each worker's state dict to corresponding worker
+        teacher_futures = []
+        for worker_idx, student_state_dict in enumerate(student_states):
+            future = self.worker_group.workers[worker_idx].update_model_with_ema.remote(
+                student_state_dict=student_state_dict,
+                ema_decay=ema_decay
+            )
+            teacher_futures.append(future)
+        ray.get(teacher_futures)

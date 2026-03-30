@@ -21,11 +21,13 @@ from nemo_rl.data.datasets.response_datasets.dapo_math import (
     DAPOMathAIME2024Dataset,
 )
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
+
+from nemo_rl.data.datasets.response_datasets.openthoughts import OpenThoughtsDataset
+
 from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import (
     GeneralConversationsJsonlDataset,
 )
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
-from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
@@ -49,6 +51,7 @@ DATASET_REGISTRY = {
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
+    "OpenThoughts": OpenThoughtsDataset,
     "geometry3k": Geometry3KDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "open_assistant": OasstDataset,
@@ -56,7 +59,6 @@ DATASET_REGISTRY = {
     "refcoco": RefCOCODataset,
     "squad": SquadDataset,
     "tulu3_sft_mixture": Tulu3SftMixtureDataset,
-    "gsm8k": GSM8KDataset,
     # load from local JSONL file or HuggingFace
     "openai_format": OpenAIFormatDataset,
     "NemoGymDataset": NemoGymDataset,
@@ -96,8 +98,8 @@ __all__ = [
     "GeneralConversationsJsonlDataset",
     "DAPOMath17KDataset",
     "DAPOMathAIME2024Dataset",
-    "GSM8KDataset",
     "DeepScalerDataset",
+    "OpenThoughtsDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
     "NemoGymDataset",

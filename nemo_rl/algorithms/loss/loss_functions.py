@@ -204,9 +204,6 @@ class ClippedPGLossFn(LossFunction):
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
-            curr_logprobs_unfiltered = data.get(
-                "curr_logprobs_unfiltered", curr_logprobs
-            )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -276,39 +273,27 @@ class ClippedPGLossFn(LossFunction):
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
-            # When top-k/top-p filtering is enabled, we need special handling for KL:
-            # - reference_policy_logprobs is computed **without** filtering (see use_reference_model)
-            # - curr_logprobs/prev_logprobs are computed **with** filtering (for actor loss compatibility)
-            # - For KL, we need curr_logprobs **without** filtering to be consistent with ref logprobs
-            # - For importance weights, we also use unfiltered curr_logprobs_unfiltered since we're
-            #   reweighting samples from π_gen_filtered to π_curr_unfiltered
-
-            # On-policy KL approximation
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
-                    curr_logprobs_unfiltered - generation_logprobs
+                    curr_logprobs - generation_logprobs
                 ).detach()
                 kl_importance_weights = torch.nan_to_num(
                     kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
-
-            # Compute KL loss
+                kl_importance_weights = torch.ones_like(curr_logprobs)
             kl = (
                 kl_importance_weights
                 * self.reference_policy_kl_penalty
                 * calculate_kl(
-                    logprobs=curr_logprobs_unfiltered,
+                    logprobs=curr_logprobs,
                     logprobs_reference=reference_policy_logprobs,
                     kl_type=self.reference_policy_kl_type,
                     input_clamp_value=self.kl_input_clamp_value,
                     output_clamp_value=self.kl_output_clamp_value,
                 )
             )
-
-            # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
                     kl, mask, global_normalization_factor=global_valid_toks
@@ -907,7 +892,7 @@ class DistillationLossFn(LossFunction):
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.log_infinitesimal = -100
 
-        assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
+        assert self.kl_type in ["forward", "reverse", "mixed", "jsd"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
@@ -922,6 +907,7 @@ class DistillationLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
+
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
@@ -935,6 +921,11 @@ class DistillationLossFn(LossFunction):
                 loss_correction_term = loss_correction_term * (
                     1.0 - self.mixed_kl_weight
                 )
+            elif self.kl_type == "jsd":
+                # Teacher assigns ~0 prob to tail tokens, so M_tail ≈ 0.5 * S_tail.
+                # KL(T_tail || M_tail) ≈ 0; KL(S_tail || M_tail) = P_rest * log(2)
+                # JSD tail correction = 0.5 * KL(S_tail || M_tail)
+                loss_correction_term = 0.5 * math.log(2) * P_rest  # [B, S-1]
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
@@ -944,6 +935,15 @@ class DistillationLossFn(LossFunction):
             per_token_kl = student_probs * (
                 student_topk_logprobs - teacher_topk_logprobs
             )
+        elif self.kl_type == "jsd":
+            # JSD(T || S) = 0.5 * KL(T || M) + 0.5 * KL(S || M), where M = 0.5 * (T + S)
+            # log(M) via logaddexp for numerical stability: log(0.5*(T+S)) = logaddexp(log_T, log_S) - log(2)
+            log_mixture = (
+                torch.logaddexp(teacher_topk_logprobs, student_topk_logprobs) - math.log(2)
+            )
+            kl_T_M = teacher_probs * (teacher_topk_logprobs - log_mixture)
+            kl_S_M = student_probs * (student_topk_logprobs - log_mixture)
+            per_token_kl = 0.5 * kl_T_M + 0.5 * kl_S_M
         else:
             # mixed KL
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
