@@ -217,6 +217,10 @@ def setup_response_data(
         return dataset, val_dataset
 
 
+# Alias for backward compatibility (used by self_distillation examples)
+setup_data_with_envs = setup_response_data
+
+
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_preference_data(
     tokenizer: AutoTokenizer, data_config: DataConfig
