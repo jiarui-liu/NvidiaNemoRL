@@ -320,6 +320,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.cpu_offload,
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
+            self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
@@ -427,7 +428,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Use automodel_forward_backward for the training loop
                 mb_results = automodel_forward_backward(
                     model=self.model,
-                    cfg=self.cfg,
+
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
                     forward_only=eval_mode,
@@ -569,7 +570,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
+    
                         post_processing_fn=logprobs_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
@@ -638,7 +639,7 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     rm_scores, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
+    
                         post_processing_fn=score_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=True,
@@ -728,7 +729,6 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     (vals, idx), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=False,
