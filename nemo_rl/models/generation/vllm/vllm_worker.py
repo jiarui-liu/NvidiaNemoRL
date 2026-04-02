@@ -491,6 +491,7 @@ class BaseVllmGenerationWorker:
         greedy: bool,
         stop_strings,
         max_new_tokens: Optional[int] = None,
+        sampling_overrides: Optional[dict] = None,
     ):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
@@ -501,9 +502,18 @@ class BaseVllmGenerationWorker:
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
 
-        return self.SamplingParams(
+        top_p = self.cfg["top_p"]
+
+        # Apply per-call overrides (e.g., for annotation generation)
+        if sampling_overrides:
+            temperature = sampling_overrides.get("temperature", temperature)
+            top_p = sampling_overrides.get("top_p", top_p)
+            top_k_val = sampling_overrides.get("top_k", top_k_val)
+            max_tokens = sampling_overrides.get("max_new_tokens", max_tokens)
+
+        kwargs = dict(
             temperature=temperature,
-            top_p=self.cfg["top_p"],
+            top_p=top_p,
             top_k=top_k_val,
             max_tokens=max_tokens,
             logprobs=0,
@@ -511,6 +521,11 @@ class BaseVllmGenerationWorker:
             stop=stop_strings,
             include_stop_str_in_output=True,
         )
+
+        if sampling_overrides and "min_p" in sampling_overrides:
+            kwargs["min_p"] = sampling_overrides["min_p"]
+
+        return self.SamplingParams(**kwargs)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -619,9 +634,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
+        sampling_overrides_raw = data.get("sampling_overrides", None)
+        # sampling_overrides may be a list (one per sample, all identical) for batch compatibility
+        if isinstance(sampling_overrides_raw, list) and len(sampling_overrides_raw) > 0:
+            sampling_overrides = sampling_overrides_raw[0]
+        else:
+            sampling_overrides = sampling_overrides_raw
         sampling_params = self._build_sampling_params(
             greedy=greedy,
             stop_strings=stop_strings,
+            sampling_overrides=sampling_overrides,
         )
 
         # verify inputs have correct padding

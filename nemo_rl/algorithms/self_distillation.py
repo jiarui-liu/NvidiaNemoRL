@@ -1451,6 +1451,7 @@ def validate(
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
         all_message_logs = []  # Collect all message logs
+        per_dataset_rewards: dict[str, list[float]] = {}  # Per-dataset tracking
 
         max_batches = (
             master_config["distillation"]["max_val_samples"]
@@ -1491,6 +1492,16 @@ def validate(
             total_rewards.extend(rewards.tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
+            # Track per-dataset rewards
+            task_names = val_batch.get("task_name", [None] * len(rewards))
+            if hasattr(task_names, "tolist"):
+                task_names = task_names.tolist()
+            for tn, r in zip(task_names, rewards.tolist()):
+                tn = tn or "unknown"
+                if tn not in per_dataset_rewards:
+                    per_dataset_rewards[tn] = []
+                per_dataset_rewards[tn].append(r)
+
             # Collect message logs for later display
             to_env = [
                 get_keys_from_message_log(
@@ -1514,6 +1525,11 @@ def validate(
             "avg_length": avg_length,
         }
 
+        # Add per-dataset accuracy
+        for dataset_name, dataset_rewards in per_dataset_rewards.items():
+            dataset_acc = sum(dataset_rewards) / len(dataset_rewards) if dataset_rewards else 0
+            val_metrics[f"accuracy/{dataset_name}"] = dataset_acc
+
         # Print sample conversations only once at the end of validation
         try:
             print_message_log_samples(
@@ -1534,8 +1550,11 @@ def validate(
     validation_time = timing_metrics.get("total_validation_time", 0)
 
     # Print summary of validation results
-    print("\n📊 Validation Results:")
-    print(f"    • Accuracy: {accuracy:.4f}")
+    print("\n  Validation Results:")
+    print(f"    • Accuracy (overall): {accuracy:.4f}")
+    for dataset_name, dataset_rewards in per_dataset_rewards.items():
+        dataset_acc = sum(dataset_rewards) / len(dataset_rewards) if dataset_rewards else 0
+        print(f"    • Accuracy ({dataset_name}): {dataset_acc:.4f} ({len(dataset_rewards)} samples)")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 

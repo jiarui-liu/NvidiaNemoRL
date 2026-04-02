@@ -878,6 +878,7 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    per_token_weight: torch.Tensor  # Optional: [B, S] per-token weights for cognitive OPSD
 
 
 class DistillationLossFn(LossFunction):
@@ -954,6 +955,13 @@ class DistillationLossFn(LossFunction):
             )
 
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+
+        # Apply per-token weights (e.g., from cognitive span annotation)
+        if "per_token_weight" in data and data["per_token_weight"] is not None:
+            per_token_weight = data["per_token_weight"][:, 1:]  # Shift for next-token prediction
+            max_len = per_token_kl.shape[1]
+            per_token_weight = per_token_weight[:, :max_len]
+            per_token_kl = per_token_kl * per_token_weight
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
