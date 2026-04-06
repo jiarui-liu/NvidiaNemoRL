@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
+import json
 import os
 import warnings
 from pathlib import Path
@@ -908,6 +909,7 @@ def distillation_train(
             val_task_to_env,
             step=total_steps,
             master_config=master_config,
+            logger=logger,
         )
         student_generation.finish_generation()
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -1208,6 +1210,7 @@ def distillation_train(
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     student_generation.finish_generation()
                     logger.log_metrics(
@@ -1345,6 +1348,48 @@ def distillation_train(
                 log_data, f"train_data_step{total_steps + 1}.jsonl"
             )
 
+            # Log per-example training records to JSONL
+            train_log_path = os.path.join(
+                logger.base_log_dir,
+                f"train_examples_step{total_steps + 1}.jsonl",
+            )
+            os.makedirs(os.path.dirname(train_log_path), exist_ok=True)
+            rb_size = repeated_batch.size
+            gt_list = repeated_batch.get("ground_truth_solution", [None] * rb_size)
+            if not isinstance(gt_list, list):
+                gt_list = [gt_list] * rb_size
+            topic_list = repeated_batch.get("topic", [None] * rb_size)
+            if not isinstance(topic_list, list):
+                topic_list = [topic_list] * rb_size
+            difficulty_list = repeated_batch.get("difficulty", [None] * rb_size)
+            if not isinstance(difficulty_list, list):
+                difficulty_list = [difficulty_list] * rb_size
+            problem_list = repeated_batch.get("problem", [None] * rb_size)
+            if not isinstance(problem_list, list):
+                problem_list = [problem_list] * rb_size
+            rewards_list = repeated_batch.get("total_reward")
+            with open(train_log_path, "w") as f:
+                for i in range(rb_size):
+                    response = ""
+                    for msg in repeated_batch["message_log"][i]:
+                        if msg["role"] == "assistant":
+                            response = msg.get("content", "")
+                    reward_val = (
+                        rewards_list[i].item()
+                        if rewards_list is not None and hasattr(rewards_list[i], "item")
+                        else (float(rewards_list[i]) if rewards_list is not None else None)
+                    )
+                    record = {
+                        "question": problem_list[i] if i < len(problem_list) else "",
+                        "ground_truth": gt_list[i] if i < len(gt_list) else "",
+                        "response": response,
+                        "reward": reward_val,
+                        "topic": topic_list[i] if i < len(topic_list) else "",
+                        "difficulty": difficulty_list[i] if i < len(difficulty_list) else 0.0,
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print(f"  Logged {rb_size} training examples to {train_log_path}")
+
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
@@ -1431,6 +1476,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -1452,6 +1498,7 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
         per_dataset_rewards: dict[str, list[float]] = {}  # Per-dataset tracking
+        all_example_records: list[dict] = []  # Per-example logging
 
         max_batches = (
             master_config["distillation"]["max_val_samples"]
@@ -1512,6 +1559,40 @@ def validate(
 
             all_message_logs.extend(to_env)
 
+            # Collect per-example records for JSONL logging
+            if logger is not None:
+                batch_size = len(val_batch["message_log"])
+                gt_list = val_batch.get("ground_truth_solution", [None] * batch_size)
+                if not isinstance(gt_list, list):
+                    gt_list = [gt_list] * batch_size
+                topic_list = val_batch.get("topic", [None] * batch_size)
+                if not isinstance(topic_list, list):
+                    topic_list = [topic_list] * batch_size
+                difficulty_list = val_batch.get("difficulty", [None] * batch_size)
+                if not isinstance(difficulty_list, list):
+                    difficulty_list = [difficulty_list] * batch_size
+                problem_list = val_batch.get("problem", [None] * batch_size)
+                if not isinstance(problem_list, list):
+                    problem_list = [problem_list] * batch_size
+
+                for i in range(batch_size):
+                    # Extract question and response from message_log
+                    question = problem_list[i] if i < len(problem_list) else None
+                    response = ""
+                    for msg in val_batch["message_log"][i]:
+                        if msg["role"] == "assistant":
+                            response = msg.get("content", "")
+
+                    record = {
+                        "question": question or "",
+                        "ground_truth": gt_list[i] if i < len(gt_list) else "",
+                        "response": response,
+                        "reward": rewards[i].item() if hasattr(rewards[i], "item") else float(rewards[i]),
+                        "topic": topic_list[i] if i < len(topic_list) else "",
+                        "difficulty": difficulty_list[i] if i < len(difficulty_list) else 0.0,
+                    }
+                    all_example_records.append(record)
+
         # Calculate validation metrics
         accuracy = (
             sum(total_rewards) / len(total_rewards) if len(total_rewards) > 0 else 0
@@ -1544,6 +1625,17 @@ def validate(
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
             print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+        # Log all validation examples to JSONL
+        if logger is not None and all_example_records:
+            val_log_path = os.path.join(
+                logger.base_log_dir, f"val_generations_step{step}.jsonl"
+            )
+            os.makedirs(os.path.dirname(val_log_path), exist_ok=True)
+            with open(val_log_path, "w") as f:
+                for record in all_example_records:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print(f"  Logged {len(all_example_records)} validation examples to {val_log_path}")
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")

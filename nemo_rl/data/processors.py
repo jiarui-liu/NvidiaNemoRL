@@ -389,6 +389,8 @@ def openthoughts_processor(
         "source",
         "test_cases",
         "starter_code",
+        "topic",
+        "difficulty",
     ]
     for key in passthrough_keys:
         if key in datum_dict:

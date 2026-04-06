@@ -15,14 +15,14 @@ import contextlib
 import io
 import logging
 import re
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
-from math_verify import grader
+from math_verify import LatexExtractionConfig, grader, parse, verify
 from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
-from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+from math_verify.parser import ExprExtractionConfig
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -57,20 +57,68 @@ def _mute_output():
         yield
 
 
+def _extract_boxed_answer(completion: str) -> Optional[str]:
+    r"""Extract the last \boxed{...} from a completion.
+
+    Handles nested braces, e.g. \boxed{\frac{1}{2}}.
+    Returns None if no \boxed{} is found.
+    """
+    prefix = "\\boxed{"
+    results = []
+    start = 0
+    while True:
+        idx = completion.find(prefix, start)
+        if idx == -1:
+            break
+        depth = 1
+        i = idx + len(prefix)
+        while i < len(completion) and depth > 0:
+            if completion[i] == "{":
+                depth += 1
+            elif completion[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            results.append(completion[idx + len(prefix) : i - 1].strip())
+        start = i
+
+    return results[-1] if results else None
+
+
+def _verify_math_answer(response: str, ground_truth: str) -> bool:
+    r"""Check whether *response* contains a correct answer for *ground_truth*.
+
+    Extracts the last \boxed{} from the response and compares it against
+    ground_truth using math-verify's parse + verify for symbolic equivalence.
+    Falls back to exact string match on extracted answer.
+    Thread-safe: does not use signal.alarm().
+    """
+    gold_str = "\\boxed{" + ground_truth + "}"
+
+    extracted = _extract_boxed_answer(response)
+    if extracted is None:
+        return False
+    pred_str = "\\boxed{" + extracted + "}"
+
+    try:
+        return float(verify(
+            parse(pred_str, parsing_timeout=None),
+            parse(gold_str, parsing_timeout=None),
+            timeout_seconds=None,
+        ))
+    except Exception:
+        pass
+
+    if extracted.strip() == ground_truth.strip():
+        return True
+
+    return False
+
+
 @ray.remote  # pragma: no cover
 class HFVerifyWorker:
     def __init__(self) -> None:
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
-
-        # Use Latex and plain math extraction from predictions
-        # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
-        self.verify_func = math_metric(
-            gold_extraction_target=(LatexExtractionConfig(),),
-            pred_extraction_target=(
-                ExprExtractionConfig(),
-                LatexExtractionConfig(),
-            ),
-        )
 
     def verify(
         self,
@@ -79,58 +127,19 @@ class HFVerifyWorker:
         return_extracted_answer: bool = False,
         **kwargs,
     ) -> Union[list[float], tuple[list[float], list[str | None]]]:
-        """Verify the correctness of the predicted responses against the ground truth.
-
-        Args:
-            pred_responses: list[str]. The predicted responses from the LLM.
-            ground_truths: list[str]. The ground truth responses.
-
-        Returns:
-            Union[list[float], tuple[list[float], list[str | None]]].
-            If return_extracted_answer is False, returns only the scores.
-            If return_extracted_answer is True, returns (scores, extracted_answers).
-        """
+        """Verify the correctness of the predicted responses against the ground truth."""
         results = []
         extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
-                with _mute_output():
-                    math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
-                    if kwargs.get("math_verify_impl") == "dapo_math_verify":
-                        # This compute_score is from the DAPO Math Verifier from Verl
-                        reward_dict = dapo_math_verify(response, ground_truth)
-                        ret_score = reward_dict["score"]
-                        extracted_answer = reward_dict["pred"]
-                    elif kwargs.get("math_verify_impl") == "hf_math_verify":
-                        ground_truth_parsable = "\\boxed{" + ground_truth + "}"
-                        ret_score, extracted_answer = self.verify_func(
-                            [ground_truth_parsable], [response]
-                        )
-                    else:
-                        raise ValueError(
-                            f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
-                        )
-
-                results.append(float(ret_score))
+                correct = _verify_math_answer(response, ground_truth)
+                results.append(1.0 if correct else 0.0)
 
                 if return_extracted_answer:
-                    # Make sure the extracted answer is not None and is a list of two elements
-                    assert extracted_answer is not None
-                    assert len(extracted_answer) == 2
-                    extracted_gold, extracted_prediction = extracted_answer
-                    # Get the extracted answer with the same logic as in the HFVerifyWorker
-                    for pred in extracted_prediction:
-                        if any(grader.verify(gold, pred) for gold in extracted_gold):
-                            extracted_answers.append(pred)
-                            break
-                    else:
-                        # If no match is found, means all answers are incorrect, just use the first prediction
-                        extracted_answers.append(extracted_prediction[0][0])
-
-            # It's possible to emit a TimeoutException and that wouldn't be caught since
-            # it actually subclasses from BaseException and math-verify itself does not
-            # to catch it.
+                    extracted_answers.append(
+                        _extract_boxed_answer(response)
+                    )
             except (Exception, TimeoutException):
                 results.append(0.0)
                 extracted_answers.append(None)
