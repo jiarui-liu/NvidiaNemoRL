@@ -778,41 +778,43 @@ def setup(
     ema_decay = distillation_config.get("ema_decay", 1.0)
 
     if ema_decay >= 1.0:
-        # No EMA: teacher and student share parameters (self-distillation mode)
-        print("\n▶ Using shared parameters for teacher (no EMA)", flush=True)
-        teacher_policy = student_policy
+        # Frozen teacher: separate copy of the base model, never updated.
+        print(f"\n▶ Setting up frozen teacher (ema_decay={ema_decay})...", flush=True)
     else:
         # EMA enabled: create separate teacher policy that will be updated via EMA
         print(f"\n▶ Setting up EMA teacher policy (decay={ema_decay})...", flush=True)
 
-        # Determine teacher checkpoint paths
-        if last_checkpoint_path:
-            teacher_weights_path = Path(last_checkpoint_path) / "teacher" / "weights"
-            # Check if teacher checkpoint exists; if not, use student weights as initialization
-            if not teacher_weights_path.exists():
-                print("  ⚠️ No teacher checkpoint found, initializing from student weights", flush=True)
-                teacher_weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        else:
-            # No checkpoint: teacher will be initialized from student weights after creation
-            teacher_weights_path = None
+    # Determine teacher checkpoint paths
+    if last_checkpoint_path:
+        teacher_weights_path = Path(last_checkpoint_path) / "teacher" / "weights"
+        # Check if teacher checkpoint exists; if not, use student weights as initialization
+        if not teacher_weights_path.exists():
+            print("  ⚠️ No teacher checkpoint found, initializing from student weights", flush=True)
+            teacher_weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+    else:
+        # No checkpoint: teacher will be initialized from student weights after creation
+        teacher_weights_path = None
 
-        # Create teacher policy (same architecture as student)
-        teacher_policy = Policy(
-            name_prefix="teacher",
-            cluster=train_cluster,
-            config=policy_config,  # Same config as student
-            tokenizer=tokenizer,
-            weights_path=teacher_weights_path,
-            optimizer_path=None,  # Teacher doesn't need optimizer
-            init_optimizer=False,
-            init_reference_model=False,
-        )
+    # Create teacher policy (same architecture as student)
+    teacher_policy = Policy(
+        name_prefix="teacher",
+        cluster=train_cluster,
+        config=policy_config,  # Same config as student
+        tokenizer=tokenizer,
+        weights_path=teacher_weights_path,
+        optimizer_path=None,  # Teacher doesn't need optimizer
+        init_optimizer=False,
+        init_reference_model=False,
+    )
 
-        # If no checkpoint, copy student weights to teacher
-        if teacher_weights_path is None:
-            print("  ⚠️ Initializing teacher from current student weights...", flush=True)
-            teacher_policy.copy_weights_from(student_policy)
+    # If no checkpoint, copy student weights to teacher
+    if teacher_weights_path is None:
+        print("  ⚠️ Initializing teacher from current student weights...", flush=True)
+        teacher_policy.copy_weights_from(student_policy)
 
+    if ema_decay >= 1.0:
+        print("  ✓ Frozen teacher initialized (will not be updated)", flush=True)
+    else:
         print(f"  ✓ EMA teacher initialized with decay={ema_decay}", flush=True)
 
     print("\n" + "=" * 60)
