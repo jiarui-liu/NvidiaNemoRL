@@ -956,6 +956,11 @@ def distillation_train(
                 )
                 with timer.time("prepare_for_generation"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
+                        print(
+                            f"[DEBUG refit] Step {total_steps+1}: refitting vLLM weights "
+                            f"(NEED_REFIT={NEED_REFIT}, STALE={POLICY_GENERATION_STALE})",
+                            flush=True,
+                        )
                         refit_policy_generation(
                             student_policy,
                             student_generation,
@@ -963,7 +968,16 @@ def distillation_train(
                             timer=timer,
                         )
                         POLICY_GENERATION_STALE = False
+                        print(
+                            f"[DEBUG refit] Step {total_steps+1}: refit complete",
+                            flush=True,
+                        )
                     else:
+                        print(
+                            f"[DEBUG refit] Step {total_steps+1}: SKIPPING refit "
+                            f"(NEED_REFIT={NEED_REFIT}, STALE={POLICY_GENERATION_STALE})",
+                            flush=True,
+                        )
                         student_generation.prepare_for_generation()
 
                 with timer.time("generation"):

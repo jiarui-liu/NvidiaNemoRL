@@ -81,6 +81,33 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+def _build_lora_module_map(model: nn.Module) -> dict[str, nn.Module]:
+    """Build a mapping from state_dict parameter names to LoRA modules.
+
+    Handles naming mismatches between model.state_dict() and model.named_modules()
+    caused by activation checkpointing wrappers (e.g. '_checkpoint_wrapped_module')
+    or other wrappers like '_orig_mod' from torch.compile.
+
+    state_dict uses:    model.layers.0.self_attn.q_proj.weight
+    named_modules uses: model.layers.0.self_attn._checkpoint_wrapped_module.q_proj
+    """
+    lora_modules: dict[str, nn.Module] = {}
+    for mod_name, mod in model.named_modules():
+        if isinstance(mod, LinearLoRA):
+            # Store by the original name
+            lora_modules[mod_name] = mod
+            # Also store with internal wrapper segments removed
+            # e.g. "model.layers.0.self_attn._checkpoint_wrapped_module.q_proj"
+            #    -> "model.layers.0.self_attn.q_proj"
+            cleaned = mod_name
+            for wrapper in ("_checkpoint_wrapped_module.", "_orig_mod."):
+                cleaned = cleaned.replace(wrapper, "")
+            if cleaned != mod_name:
+                lora_modules[cleaned] = mod
+
+    return lora_modules
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -95,11 +122,39 @@ def dtensor_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
+    lora_map = _build_lora_module_map(model)
+
+    # DEBUG: log the name mapping once
+    _sd_keys = [k for k in model.state_dict().keys() if "layers.0.self_attn.q_proj" in k]
+    _mod_keys = [k for k in module_map.keys() if "q_proj" in k and "lora" not in k][:5]
+    _lora_keys = list(lora_map.keys())[:5]
+    print(
+        f"[DEBUG refit-send] name mapping check:\n"
+        f"  state_dict keys (q_proj): {_sd_keys}\n"
+        f"  named_modules keys containing q_proj (first 5): {_mod_keys}\n"
+        f"  lora_map keys (first 5): {_lora_keys}\n"
+        f"  total lora_map entries: {len(lora_map)}",
+        flush=True,
+    )
+
+    _debug_count = 0
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
+        merged_tensor = _maybe_merge_lora_weight(module_map, lora_map, name, full_tensor)
+
+        # DEBUG: log whether LoRA merge changed the tensor (first 3 .weight entries)
+        if _debug_count < 3 and name.endswith(".weight"):
+            _lora_diff = (merged_tensor - full_tensor).abs()
+            _did_merge = _lora_diff.max().item() > 0
+            print(
+                f"[DEBUG refit-send] {name}: merged={_did_merge}, "
+                f"delta_max={_lora_diff.max().item():.6e}, "
+                f"tensor_sum={merged_tensor.sum().item():.8e}",
+                flush=True,
+            )
+            _debug_count += 1
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
@@ -117,13 +172,17 @@ def dtensor_params_generator(
 @torch.no_grad()
 def _maybe_merge_lora_weight(
     module_map: dict[str, nn.Module],
+    lora_map: dict[str, nn.Module],
     fqn: str,
     tensor: torch.Tensor,
 ) -> torch.Tensor:
     if not fqn.endswith(".weight"):
         return tensor
     module_name = fqn[: -len(".weight")]
+    # Try direct lookup first, then fallback to lora_map which handles prefix mismatches
     module = module_map.get(module_name)
+    if not isinstance(module, LinearLoRA):
+        module = lora_map.get(module_name)
     if not isinstance(module, LinearLoRA):
         return tensor
     if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):

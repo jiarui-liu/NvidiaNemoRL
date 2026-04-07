@@ -92,6 +92,7 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._debug_refit_count = 0
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -131,9 +132,13 @@ class VllmInternalWorkerExtension:
         """
         buffer = None
         weights = None
+        self._debug_refit_count = getattr(self, "_debug_refit_count", 0) + 1
+        _refit_id = self._debug_refit_count
 
         try:
             self.maybe_init_zmq()
+            _debug_batch_count = 0
+            _debug_total_keys = 0
             while True:
                 # Blocking receive with timeout (this is the main operation)
                 payload = self.zmq_socket.recv_pyobj()
@@ -173,6 +178,19 @@ class VllmInternalWorkerExtension:
                 assert offset == used_bytes, (
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
+
+                # DEBUG: log incoming weight stats for first batch
+                _debug_batch_count += 1
+                _debug_total_keys += len(list_keys)
+                if _debug_batch_count == 1:
+                    for _wk, _wv in weights[:3]:
+                        print(
+                            f"[DEBUG refit-recv #{_refit_id}] incoming: {_wk}, "
+                            f"shape={list(_wv.shape)}, dtype={_wv.dtype}, "
+                            f"sum={_wv.float().sum().item():.8e}",
+                            flush=True,
+                        )
+
                 # Load weights into the model
                 from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -180,7 +198,15 @@ class VllmInternalWorkerExtension:
                     # the fp8 load_weights additionally casts bf16 weights into fp8
                     fp8.load_weights(weights, self.model_runner)
                 else:
-                    self.model_runner.model.load_weights(weights=weights)
+                    loaded = self.model_runner.model.load_weights(weights=weights)
+                    # DEBUG: log how many weights were actually loaded
+                    if _debug_batch_count <= 2:
+                        print(
+                            f"[DEBUG refit-recv #{_refit_id}] batch {_debug_batch_count}: "
+                            f"load_weights returned {len(loaded) if loaded else 0} keys, "
+                            f"sample: {list(loaded)[:3] if loaded else 'None'}",
+                            flush=True,
+                        )
 
                 torch.cuda.current_stream().synchronize()
 
@@ -193,6 +219,28 @@ class VllmInternalWorkerExtension:
                 weights = None
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+            print(
+                f"[DEBUG refit-recv #{_refit_id}] total batches={_debug_batch_count}, "
+                f"total keys={_debug_total_keys}",
+                flush=True,
+            )
+
+            # DEBUG: print current vLLM model param sums (compare across refits to see if they change)
+            try:
+                _count = 0
+                for _dn, _dp in self.model_runner.model.named_parameters():
+                    if "layers.0." in _dn and "weight" in _dn:
+                        print(
+                            f"[DEBUG refit-recv #{_refit_id}] vllm_param: {_dn}, "
+                            f"sum={_dp.detach().float().sum().item():.8e}",
+                            flush=True,
+                        )
+                        _count += 1
+                        if _count >= 3:
+                            break
+            except Exception as _e:
+                print(f"[DEBUG refit-recv #{_refit_id}] param-read error: {_e}", flush=True)
 
             # Process weights after loading for FP8 KV cache
             self._maybe_process_fp8_kv_cache()
