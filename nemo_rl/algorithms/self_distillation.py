@@ -1410,9 +1410,19 @@ def distillation_train(
                 reduction_op="sum"
             )  # type: ignore
 
+            # Compute training accuracy from rollout rewards
+            if rewards_list is not None:
+                train_accuracy = float(sum(
+                    r.item() if hasattr(r, "item") else float(r)
+                    for r in rewards_list
+                ) / len(rewards_list))
+                metrics["accuracy"] = train_accuracy
+
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
+            if "accuracy" in metrics:
+                print(f"  • Training Accuracy: {metrics['accuracy']:.4f}")
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
             )
