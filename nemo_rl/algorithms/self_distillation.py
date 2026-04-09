@@ -310,11 +310,12 @@ def _build_teacher_inputs_with_cot_in_user_turn(
         # Everything before this position is user message content; everything from
         # this position onward is the chat-template suffix + assistant response.
         #
-        # For models that auto-inject a system message (e.g. OLMo), the first
-        # <|im_end|> belongs to the system turn — use the LAST one instead.
+        # For models that auto-inject a system message (e.g. OLMo, Qwen),
+        # the first <|im_end|> belongs to the system turn — use the LAST one.
         user_portion = input_ids[i, :first_assistant_pos]
         im_end_positions = (user_portion == im_end_id).nonzero(as_tuple=False)
-        _use_last = "olmo" in model_name.lower()
+        _model_lower = model_name.lower()
+        _use_last = "olmo" in _model_lower or "qwen" in _model_lower
         im_end_pos = (
             int(im_end_positions[-1 if _use_last else 0].item())
             if im_end_positions.numel() > 0
