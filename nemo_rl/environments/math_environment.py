@@ -85,20 +85,6 @@ def _extract_boxed_answer(completion: str) -> Optional[str]:
     return results[-1] if results else None
 
 
-def _run_verify_in_process(pred_str: str, gold_str: str, result_queue):
-    """Target function for subprocess-based math verification."""
-    try:
-        from math_verify import parse, verify
-        result = float(verify(
-            parse(pred_str, parsing_timeout=None),
-            parse(gold_str, parsing_timeout=None),
-            timeout_seconds=None,
-        ))
-        result_queue.put(("ok", result))
-    except Exception as e:
-        result_queue.put(("error", str(e)))
-
-
 def _verify_math_answer(response: str, ground_truth: str, timeout_sec: int = 120) -> bool:
     r"""Check whether *response* contains a correct answer for *ground_truth*.
 
@@ -107,11 +93,10 @@ def _verify_math_answer(response: str, ground_truth: str, timeout_sec: int = 120
     Falls back to exact string match on extracted answer.
 
     A hard *timeout_sec* (default 120s) guard is used so that pathological
-    LaTeX expressions cannot hang the worker indefinitely.  Uses a subprocess
-    so it works inside Ray workers (where SIGALRM is not available).
+    LaTeX expressions cannot hang the worker indefinitely.  Uses a spawned
+    subprocess so it works inside Ray workers (where SIGALRM is not available
+    and fork() deadlocks due to CUDA/NCCL state).
     """
-    import multiprocessing
-
     gold_str = "\\boxed{" + ground_truth + "}"
 
     extracted = _extract_boxed_answer(response)
@@ -119,37 +104,17 @@ def _verify_math_answer(response: str, ground_truth: str, timeout_sec: int = 120
         return False
     pred_str = "\\boxed{" + extracted + "}"
 
-    result_queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(
-        target=_run_verify_in_process,
-        args=(pred_str, gold_str, result_queue),
-    )
-    proc.start()
-    proc.join(timeout=timeout_sec)
+    # First try without subprocess (fast path for non-pathological inputs)
+    try:
+        return float(verify(
+            parse(pred_str, parsing_timeout=10),
+            parse(gold_str, parsing_timeout=10),
+            timeout_seconds=30,
+        ))
+    except (Exception, TimeoutException):
+        pass
 
-    if proc.is_alive():
-        # Timed out — kill the process
-        proc.kill()
-        proc.join()
-        logging.getLogger("math_verify").warning(
-            "math_verify timed out after %ds. Marking as incorrect.\n"
-            "  ground_truth: %s\n"
-            "  extracted: %s\n"
-            "  full response:\n%s",
-            timeout_sec,
-            ground_truth,
-            extracted,
-            response,
-        )
-        return False
-
-    # Process finished — get result
-    if not result_queue.empty():
-        status, value = result_queue.get_nowait()
-        if status == "ok":
-            return value
-        # status == "error": fall through to string match
-
+    # If the fast path failed/timed out, fall back to string match
     if extracted.strip() == ground_truth.strip():
         return True
 
