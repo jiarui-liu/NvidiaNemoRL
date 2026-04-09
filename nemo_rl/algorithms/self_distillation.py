@@ -252,6 +252,7 @@ def _build_teacher_inputs_with_cot_in_user_turn(
     max_seq_len: Optional[int],
     make_sequence_length_divisible_by: int,
     chat_template_kwargs: Optional[dict] = None,
+    model_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
     """Build teacher inputs by inserting COT+GT tokens into the user turn.
 
@@ -305,13 +306,17 @@ def _build_teacher_inputs_with_cot_in_user_turn(
             cot_lengths.append(0)
             continue
 
-        # Find the first <|im_end|> in the user portion of the student sequence.
+        # Find the <|im_end|> in the user portion of the student sequence.
         # Everything before this position is user message content; everything from
         # this position onward is the chat-template suffix + assistant response.
+        #
+        # For models that auto-inject a system message (e.g. OLMo), the first
+        # <|im_end|> belongs to the system turn — use the LAST one instead.
         user_portion = input_ids[i, :first_assistant_pos]
         im_end_positions = (user_portion == im_end_id).nonzero(as_tuple=False)
+        _use_last = "olmo" in model_name.lower()
         im_end_pos = (
-            int(im_end_positions[0].item())
+            int(im_end_positions[-1 if _use_last else 0].item())
             if im_end_positions.numel() > 0
             else first_assistant_pos
         )
@@ -1080,6 +1085,7 @@ def distillation_train(
                         "chat_template_kwargs"
                     )
                     or {},
+                    model_name=master_config["policy"].get("model_name", ""),
                 )
 
                 # DEBUG: verify COT tokens are inserted into teacher context
